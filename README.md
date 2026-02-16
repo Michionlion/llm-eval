@@ -158,6 +158,7 @@ On-disk cache of calibration results keyed by base URL, model, and target prompt
 ## Notes
 
 - Each recorded request runs **two calls**: one streaming (for TTFT/stream timing) and one non-streaming (for usage). Warmups remain streaming-only.
+- Calibration is now seeded from warmup runs: the first requests are warmups, and additional calibration calls only happen after warmup when the warmup prompt is outside tolerance.
 - The calibrated prompt **text** itself is intentionally not written to CSV to keep files small. If you want it included, we can add an opt-in column.
 - Errors are retried with backoff (1s, 5s, 15s, 30s). In the TUI, the Status line shows a per-second countdown before each retry.
 - For thinking models that emit `reasoning_content`, streaming TTFT/live estimates count reasoning output as well as visible content; usage splits reasoning vs visible tokens when available.

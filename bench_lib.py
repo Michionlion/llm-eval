@@ -338,6 +338,28 @@ def build_prompt_with_filler(filler_chars: int, instructions: str = DEFAULT_USER
     return header + filler + footer
 
 
+def _estimate_filler_chars(cfg: BenchConfig, instructions: str) -> int:
+    header = instructions + "\nBEGIN FILLER\n"
+    footer = "\nEND FILLER\n"
+    overhead_chars = len(header) + len(footer)
+    est_total_chars = int(cfg.target_prompt_tokens * cfg.chars_per_token_est)
+    return max(0, est_total_chars - overhead_chars)
+
+
+def _prompt_guess(cfg: BenchConfig, instructions: str) -> str:
+    filler_chars = _estimate_filler_chars(cfg, instructions)
+    return build_prompt_with_filler(filler_chars, instructions)
+
+
+def _calibration_fields(calib: CalibrationResult) -> Dict[str, Any]:
+    return {
+        "calibration_prompt_tokens": calib.prompt_tokens,
+        "calibration_char_len": calib.char_len,
+        "calibration_iters": calib.iters,
+        "calibration_ts_utc": calib.ts_utc,
+    }
+
+
 # ----------------------------
 # HTTP calls
 # ----------------------------
@@ -715,18 +737,22 @@ async def run_benchmark(
     calib: CalibrationResult
 
     async with httpx.AsyncClient() as client:
-        # Calibration per model / target tokens
-        calib = await calibrate_prompt(
-            client,
-            cfg,
-            system=system,
-            instructions=instructions,
-            cache=cache,
-            on_stream_update=on_stream_update,
-        )
-        prompt = calib.prompt
+        key = CalibrationKey(cfg.base_url, cfg.model, cfg.target_prompt_tokens, system, instructions)
+        calib_cached = cache.get(key) if cache else None
+        if calib_cached:
+            prompt = calib_cached.prompt
+            calib = calib_cached
+        else:
+            prompt = _prompt_guess(cfg, instructions)
+            calib = CalibrationResult(
+                prompt=prompt,
+                prompt_tokens=0,
+                char_len=len(prompt),
+                iters=0,
+                ts_utc=_now_utc_iso(),
+            )
         warmup_count = max(3, cfg.warmup)
-        meta = {
+        meta_common = {
             "base_url": cfg.base_url,
             "model": cfg.model,
             "target_prompt_tokens": cfg.target_prompt_tokens,
@@ -739,11 +765,8 @@ async def run_benchmark(
             "stream_ttft": bool(cfg.stream_ttft),
             "include_usage_in_stream": bool(cfg.include_usage_in_stream),
             "chars_per_token_est": cfg.chars_per_token_est,
-            "calibration_prompt_tokens": calib.prompt_tokens,
-            "calibration_char_len": calib.char_len,
-            "calibration_iters": calib.iters,
-            "calibration_ts_utc": calib.ts_utc,
         }
+        warmup_calib_fields = _calibration_fields(calib)
 
         # Warmup (sequential)
         warmup_ttf_ts: list[float] = []
@@ -771,11 +794,14 @@ async def run_benchmark(
                     completion_tps, prefill_tps, decode_tps = _derive_rates(pt, ct, _wall, warm_ttft)
                     completion_tps_reasoning, decode_tps_reasoning = _derive_completion_rates(rt, _wall, warm_ttft)
                     completion_tps_visible, decode_tps_visible = _derive_completion_rates(visible_ct, _wall, warm_ttft)
+                    warmup_calib_prompt_tokens = pt if pt > 0 else warmup_calib_fields["calibration_prompt_tokens"]
                     warmup_results.append(
                         RequestResult(
                             job_id=job_id,
                             idx=-(i + 1),
-                            **meta,
+                            **meta_common,
+                            **warmup_calib_fields,
+                            calibration_prompt_tokens=warmup_calib_prompt_tokens,
                             run_mode="stream",
                             warmup_run=True,
                             ok=True,
@@ -804,11 +830,14 @@ async def run_benchmark(
                     completion_tps, prefill_tps, decode_tps = _derive_rates(pt, ct, _wall, 0.0)
                     completion_tps_reasoning, _decode_tps_reasoning = _derive_completion_rates(rt, _wall, 0.0)
                     completion_tps_visible, _decode_tps_visible = _derive_completion_rates(visible_ct, _wall, 0.0)
+                    warmup_calib_prompt_tokens = pt if pt > 0 else warmup_calib_fields["calibration_prompt_tokens"]
                     warmup_results.append(
                         RequestResult(
                             job_id=job_id,
                             idx=-(i + 1),
-                            **meta,
+                            **meta_common,
+                            **warmup_calib_fields,
+                            calibration_prompt_tokens=warmup_calib_prompt_tokens,
                             run_mode="nonstream",
                             warmup_run=True,
                             ok=True,
@@ -836,7 +865,8 @@ async def run_benchmark(
                     RequestResult(
                         job_id=job_id,
                         idx=-(i + 1),
-                        **meta,
+                        **meta_common,
+                        **warmup_calib_fields,
                         run_mode="stream",
                         warmup_run=True,
                         ok=False,
@@ -860,6 +890,39 @@ async def run_benchmark(
                 if on_warmup_done:
                     await on_warmup_done(warmup_results[-1])
 
+        if not calib_cached:
+            warmup_pts = [r.prompt_tokens for r in warmup_results if r.ok and r.prompt_tokens > 0]
+            warmup_pt = int(round(sum(warmup_pts) / len(warmup_pts))) if warmup_pts else 0
+            warmup_iters = 0
+            if warmup_pt == 0:
+                try:
+                    warmup_pt = await _usage_prompt_tokens_only(client, cfg, prompt, system)
+                    warmup_iters = 1
+                except Exception:
+                    warmup_pt = 0
+            tol = max(0, int(cfg.calibration_tolerance_tokens))
+            if warmup_pt > 0 and abs(warmup_pt - cfg.target_prompt_tokens) <= tol:
+                calib = CalibrationResult(
+                    prompt=prompt,
+                    prompt_tokens=warmup_pt,
+                    char_len=len(prompt),
+                    iters=warmup_iters,
+                    ts_utc=_now_utc_iso(),
+                )
+                if cache:
+                    cache.put(key, calib)
+            else:
+                calib = await calibrate_prompt(
+                    client,
+                    cfg,
+                    system=system,
+                    instructions=instructions,
+                    cache=cache,
+                    on_stream_update=on_stream_update,
+                )
+                prompt = calib.prompt
+
+        record_calib_fields = _calibration_fields(calib)
         results: List[RequestResult] = []
         errors: List[str] = []
 
@@ -941,7 +1004,8 @@ async def run_benchmark(
                 stream_rr = RequestResult(
                     job_id=job_id,
                     idx=idx,
-                    **meta,
+                    **meta_common,
+                    **record_calib_fields,
                     run_mode="stream",
                     warmup_run=False,
                     ok=(stream_err == ""),
@@ -965,7 +1029,8 @@ async def run_benchmark(
                 nonstream_rr = RequestResult(
                     job_id=job_id,
                     idx=idx,
-                    **meta,
+                    **meta_common,
+                    **record_calib_fields,
                     run_mode="nonstream",
                     warmup_run=False,
                     ok=(nonstream_err == ""),

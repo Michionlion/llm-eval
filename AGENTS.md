@@ -14,8 +14,8 @@ This repository is a Textual TUI + benchmarking library for OpenAI‑compatible 
 2. User selects models + parallelism + input sizes; TUI sweeps context sizes (1/8 → full by default, controlled by `SWEEP_COUNT`).
 3. For each (model, ctx, par) job, TUI calls `bench_lib.run_benchmark`.
 4. `run_benchmark` does:
-   - **Calibration**: token‑targeted prompt construction (`calibrate_prompt`).
-   - **Warmup**: sequential streaming requests only (min 3).
+   - **Warmup**: sequential streaming requests only (min 3) using a cached or estimated prompt.
+   - **Calibration**: seeded from warmup usage; if warmup prompt is outside tolerance, extra calibration calls happen after warmup.
    - **Recorded run**: for each logical request index, performs **two calls**:
      - streaming call (TTFT + streaming wall time)
      - non‑streaming call (usage + non‑stream wall time)
@@ -39,7 +39,7 @@ This repository is a Textual TUI + benchmarking library for OpenAI‑compatible 
 
 ### `bench_lib.py`
 
-- `run_benchmark` orchestrates calibration, warmup, recorded runs.
+- `run_benchmark` orchestrates warmup-first calibration and recorded runs.
 - **Warmup min 3** enforced inside `run_benchmark`.
 - **Two‑call recorded requests**:
   - Streaming call: `_one_request_stream_live`
