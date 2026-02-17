@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import re
 import statistics
@@ -360,6 +361,18 @@ def _calibration_fields(calib: CalibrationResult) -> Dict[str, Any]:
     }
 
 
+def _cache_bust_prefix(tag: str) -> str:
+    seed = f"{tag}|{time.time_ns()}|{time.perf_counter_ns()}"
+    code = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+    return f"[bench-cache-bust:{code}]\n"
+
+
+def _prefix_cache_bust(prompt: str, tag: Optional[str]) -> str:
+    if not tag:
+        return prompt
+    return _cache_bust_prefix(tag) + prompt
+
+
 # ----------------------------
 # HTTP calls
 # ----------------------------
@@ -407,11 +420,14 @@ async def _one_request_nonstream(
     cfg: BenchConfig,
     prompt: str,
     system: str,
+    *,
+    cache_bust_tag: Optional[str] = None,
 ) -> Tuple[float, Tuple[int, int, int, int]]:
     url = _join_url(cfg.base_url, "/v1/chat/completions")
+    prompt_for_request = _prefix_cache_bust(prompt, cache_bust_tag)
     payload = {
         "model": cfg.model,
-        "messages": make_messages(prompt, system),
+        "messages": make_messages(prompt_for_request, system),
         "temperature": cfg.temperature,
         "stream": False,
     }
@@ -432,6 +448,7 @@ async def _one_request_stream_live(
     job_id: str,
     idx: int,
     on_stream_update: Optional[OnStreamUpdate],
+    cache_bust_tag: Optional[str] = None,
 ) -> Tuple[float, float, Optional[Tuple[int, int, int, int]]]:
     """
     Streaming request with:
@@ -445,9 +462,11 @@ async def _one_request_stream_live(
     if cfg.api_key:
         headers["Authorization"] = f"Bearer {cfg.api_key}"
 
+    prompt_for_request = _prefix_cache_bust(prompt, cache_bust_tag)
+
     payload: Dict[str, Any] = {
         "model": cfg.model,
-        "messages": make_messages(prompt, system),
+        "messages": make_messages(prompt_for_request, system),
         "temperature": cfg.temperature,
         "stream": True,
     }
@@ -783,6 +802,7 @@ async def run_benchmark(
                         job_id=job_id,
                         idx=-(i + 1),
                         on_stream_update=None,
+                        cache_bust_tag=f"{job_id}:warmup:{i}:stream",
                     )
                     if warm_ttft > 0:
                         warmup_ttf_ts.append(warm_ttft)
@@ -825,7 +845,13 @@ async def run_benchmark(
                     if on_warmup_done:
                         await on_warmup_done(warmup_results[-1])
                 else:
-                    _wall, (pt, ct, tt, rt) = await _one_request_nonstream(client, warm_cfg, prompt, system)
+                    _wall, (pt, ct, tt, rt) = await _one_request_nonstream(
+                        client,
+                        warm_cfg,
+                        prompt,
+                        system,
+                        cache_bust_tag=f"{job_id}:warmup:{i}:nonstream",
+                    )
                     visible_ct = max(0, ct - rt)
                     completion_tps, prefill_tps, decode_tps = _derive_rates(pt, ct, _wall, 0.0)
                     completion_tps_reasoning, _decode_tps_reasoning = _derive_completion_rates(rt, _wall, 0.0)
@@ -927,10 +953,18 @@ async def run_benchmark(
         errors: List[str] = []
 
         async def one(idx: int) -> None:
-            async def attempt_once() -> tuple[RequestResult, RequestResult, List[str]]:
+            async def attempt_once(attempt_no: int) -> tuple[RequestResult, RequestResult, List[str]]:
                 errors_local: List[str] = []
+                pair_seq = 0
 
-                async def run_pair() -> tuple[float, float, str, float, Optional[Tuple[int, int, int, int]], str]:
+                async def run_pair(
+                    run_label: str,
+                ) -> tuple[float, float, str, float, Optional[Tuple[int, int, int, int]], str]:
+                    nonlocal pair_seq
+                    pair_seq += 1
+                    tag_base = (
+                        f"{job_id}:req:{idx}:attempt:{attempt_no}:run:{run_label}:pair:{pair_seq}"
+                    )
                     stream_wall = 0.0
                     ttft = 0.0
                     stream_err = ""
@@ -944,6 +978,7 @@ async def run_benchmark(
                                 job_id=job_id,
                                 idx=idx,
                                 on_stream_update=on_stream_update,
+                                cache_bust_tag=f"{tag_base}:stream",
                             )
                         except Exception as e:
                             stream_err = f"stream[{idx}]: {type(e).__name__}: {_truncate(str(e), 1200)}"
@@ -954,13 +989,21 @@ async def run_benchmark(
                     nonstream_usage: Optional[Tuple[int, int, int, int]] = None
                     nonstream_err = ""
                     try:
-                        nonstream_wall, nonstream_usage = await _one_request_nonstream(client, cfg, prompt, system)
+                        nonstream_wall, nonstream_usage = await _one_request_nonstream(
+                            client,
+                            cfg,
+                            prompt,
+                            system,
+                            cache_bust_tag=f"{tag_base}:nonstream",
+                        )
                     except Exception as e:
                         nonstream_err = f"nonstream[{idx}]: {type(e).__name__}: {_truncate(str(e), 1200)}"
 
                     return stream_wall, ttft, stream_err, nonstream_wall, nonstream_usage, nonstream_err
 
-                stream_wall, ttft, stream_err, nonstream_wall, nonstream_usage, nonstream_err = await run_pair()
+                stream_wall, ttft, stream_err, nonstream_wall, nonstream_usage, nonstream_err = await run_pair(
+                    "base"
+                )
 
                 if stream_err and cfg.stream_ttft:
                     errors_local.append(stream_err)
@@ -968,7 +1011,9 @@ async def run_benchmark(
                     errors_local.append(nonstream_err)
 
                 if not errors_local and stream_wall > 0 and stream_wall < 10.0:
-                    stream_wall2, ttft2, stream_err2, nonstream_wall2, nonstream_usage2, nonstream_err2 = await run_pair()
+                    stream_wall2, ttft2, stream_err2, nonstream_wall2, nonstream_usage2, nonstream_err2 = await run_pair(
+                        "avg"
+                    )
                     if stream_err2 or nonstream_err2:
                         errors_local.append(
                             f"run[{idx}] retry failed: {stream_err2 or nonstream_err2}"
@@ -1056,7 +1101,7 @@ async def run_benchmark(
             retry_delays_s = [1, 5, 15, 30]
             attempt = 0
             while True:
-                stream_rr, nonstream_rr, errors_local = await attempt_once()
+                stream_rr, nonstream_rr, errors_local = await attempt_once(attempt)
                 if errors_local:
                     if on_stream_update:
                         await on_stream_update(
