@@ -7,4 +7,4 @@ fi
 # shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
 pip install --upgrade -r requirements.txt -q
-python bench_tui.py
+python bench_tui.py "$@"

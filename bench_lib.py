@@ -15,7 +15,7 @@ import httpx
 
 DEFAULT_SYSTEM = "You are a helpful assistant."
 DEFAULT_USER_INSTRUCTIONS = (
-    "Generate about 512 tokens of plain text. "
+    "Keep generating as much plain text as possible. "
     "Do not be concise. Avoid lists or formatting. End only when you run out of tokens.\n"
 )
 FILLER_SENTENCE = (

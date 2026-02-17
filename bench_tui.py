@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import argparse
+import datetime as dt
+import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -72,8 +77,9 @@ class LLMBenchTUI(App):
 
     BINDINGS = [("q", "quit", "Quit")]
 
-    def __init__(self):
+    def __init__(self, *, background_mode: bool = False):
         super().__init__()
+        self.background_mode = background_mode
         self.base_url = os.getenv("BASE_URL", "")
         self.api_key = os.getenv("LITELLM_KEY", "")
 
@@ -81,6 +87,8 @@ class LLMBenchTUI(App):
         self.requests_csv = Path(os.getenv("REQUESTS_CSV", "requests.csv"))
         self.load_times_csv = Path(os.getenv("LOAD_TIMES_CSV", "load_times.csv"))
         self.cache_path = Path(os.getenv("CALIBRATION_CACHE", "./.cache/calibration_cache.json"))
+        self.background_config_dir = Path(os.getenv("BACKGROUND_CONFIG_DIR", "./.cache/background_runs"))
+        self.background_log_dir = Path(os.getenv("BACKGROUND_LOG_DIR", "./logs"))
         self.cache = CalibrationCache(self.cache_path)
 
         self.models: List[str] = []
@@ -256,6 +264,73 @@ class LLMBenchTUI(App):
 
     def _set_pre_status(self, text: str) -> None:
         self.query_one("#pre_status_text", Static).update(f"Status: {text}")
+
+    def _build_context_sizes(self, target_prompt_tokens: int, sweep_count: int) -> List[int]:
+        max_tokens = max(1, target_prompt_tokens)
+        if sweep_count <= 1:
+            return [max_tokens]
+        context_sizes: List[int] = []
+        for i in range(1, sweep_count + 1):
+            size = max(1, (max_tokens * i + (sweep_count - 1)) // sweep_count)
+            if not context_sizes or size != context_sizes[-1]:
+                context_sizes.append(size)
+        if context_sizes[-1] != max_tokens:
+            context_sizes.append(max_tokens)
+        return context_sizes
+
+    def _launch_background_run(
+        self,
+        *,
+        models: List[str],
+        pars: List[int],
+        context_sizes: List[int],
+        out_tokens: int,
+        runs: int,
+        warmup: int,
+        timeout_s: float,
+        chars_per_token_est: float,
+    ) -> tuple[int, Path, Path]:
+        ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        self.background_config_dir.mkdir(parents=True, exist_ok=True)
+        self.background_log_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = self.background_config_dir / f"bench_run_{ts}.json"
+        log_path = self.background_log_dir / f"bench_run_{ts}.log"
+
+        payload = {
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "summary_csv": str(self.summary_csv),
+            "requests_csv": str(self.requests_csv),
+            "load_times_csv": str(self.load_times_csv),
+            "calibration_cache": str(self.cache_path),
+            "models": models,
+            "pars": pars,
+            "context_sizes": context_sizes,
+            "out_tokens": out_tokens,
+            "runs": runs,
+            "warmup": warmup,
+            "timeout_s": timeout_s,
+            "chars_per_token_est": chars_per_token_est,
+            "launched_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+        cfg_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        try:
+            os.chmod(cfg_path, 0o600)
+        except Exception:
+            pass
+
+        script_path = Path(__file__).resolve().parent / "bench_headless.py"
+        with log_path.open("ab") as log_file:
+            proc = subprocess.Popen(
+                [sys.executable, str(script_path), "--config", str(cfg_path)],
+                cwd=str(Path(__file__).resolve().parent),
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        return proc.pid, cfg_path, log_path
 
     def _spin_input(
         self,
@@ -781,21 +856,37 @@ class LLMBenchTUI(App):
             self._set_pre_status("Warmup raised to 3 (minimum).")
             self._log_pre_message("Warmup raised to 3 (minimum).")
 
+        context_sizes = self._build_context_sizes(target_prompt_tokens, sweep_count)
+        self.context_sizes = context_sizes
+
+        if self.background_mode:
+            try:
+                pid, cfg_path, log_path = self._launch_background_run(
+                    models=models,
+                    pars=pars,
+                    context_sizes=context_sizes,
+                    out_tokens=out_tokens,
+                    runs=runs,
+                    warmup=warmup,
+                    timeout_s=timeout_s,
+                    chars_per_token_est=chars_per_token_est,
+                )
+            except Exception as e:
+                self._set_pre_status(f"Failed to start background run: {e}")
+                self._log_pre_message(f"Failed to start background run: {type(e).__name__}: {e}")
+                return
+
+            exit_msg = (
+                f"\nBackground benchmark launched (pid={pid}).\n"
+                f"  Config: {cfg_path}\n"
+                f"  Log:    {log_path}\n"
+                f"\nFollow progress with: tail -f {log_path}\n"
+            )
+            self.exit(message=exit_msg)
+            return
+
         self.query_one("#pre_run").add_class("hidden")
         self.query_one("#bench_panel").remove_class("hidden")
-
-        max_tokens = max(1, target_prompt_tokens)
-        context_sizes: List[int] = []
-        if sweep_count == 1:
-            context_sizes = [max_tokens]
-        else:
-            for i in range(1, sweep_count + 1):
-                size = max(1, (max_tokens * i + (sweep_count - 1)) // sweep_count)
-                if not context_sizes or size != context_sizes[-1]:
-                    context_sizes.append(size)
-            if context_sizes[-1] != max_tokens:
-                context_sizes.append(max_tokens)
-        self.context_sizes = context_sizes
 
         self.run_worker(
             self._run_benchmarks(
@@ -992,4 +1083,13 @@ class LLMBenchTUI(App):
         self._update_selected_models_status()
 
 if __name__ == "__main__":
-    LLMBenchTUI().run()
+    parser = argparse.ArgumentParser(description="LLM benchmark TUI")
+    parser.add_argument(
+        "--background",
+        "--backgrounding",
+        action="store_true",
+        dest="background_mode",
+        help="Configure in TUI, then detach run into a background headless process on Run click.",
+    )
+    args = parser.parse_args()
+    LLMBenchTUI(background_mode=args.background_mode).run()
