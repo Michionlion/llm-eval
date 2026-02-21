@@ -65,6 +65,25 @@ def _load_config(path: Path) -> Dict[str, Any]:
     return data
 
 
+def _job_profile_for_context(
+    *,
+    ctx: int,
+    max_ctx: int,
+    runs: int,
+    out_tokens: int,
+    long_ctx_threshold: float,
+    long_ctx_runs: int,
+    out_tokens_long_ctx: int,
+) -> tuple[int, int]:
+    ratio = (ctx / max(1, max_ctx))
+    if ratio >= long_ctx_threshold:
+        return (
+            max(1, min(runs, long_ctx_runs)),
+            max(1, min(out_tokens, out_tokens_long_ctx)),
+        )
+    return runs, out_tokens
+
+
 async def run_headless(config: Dict[str, Any]) -> int:
     base_url = str(config["base_url"])
     api_key = str(config["api_key"])
@@ -79,12 +98,34 @@ async def run_headless(config: Dict[str, Any]) -> int:
     context_sizes: List[int] = [int(x) for x in config["context_sizes"]]
     out_tokens = int(config["out_tokens"])
     runs = int(config["runs"])
+    out_tokens_long_ctx = int(config.get("out_tokens_long_ctx", max(16, out_tokens // 2)))
+    long_ctx_runs = int(config.get("long_ctx_runs", 1))
+    long_ctx_threshold = float(config.get("long_ctx_threshold", 0.75))
     warmup = int(config["warmup"])
     timeout_s = float(config["timeout_s"])
     chars_per_token_est = float(config["chars_per_token_est"])
 
+    out_tokens = max(1, out_tokens)
+    out_tokens_long_ctx = max(1, out_tokens_long_ctx)
+    long_ctx_runs = max(1, long_ctx_runs)
+    long_ctx_threshold = min(1.0, max(0.0, long_ctx_threshold))
+
     total_jobs = len(models) * len(pars) * len(context_sizes)
-    total_requests = sum(runs * p for _m in models for _ctx in context_sizes for p in pars)
+    max_ctx = max(context_sizes) if context_sizes else 1
+    total_requests = 0
+    for _m in models:
+        for ctx in context_sizes:
+            for p in pars:
+                job_runs, _job_out_tokens = _job_profile_for_context(
+                    ctx=ctx,
+                    max_ctx=max_ctx,
+                    runs=runs,
+                    out_tokens=out_tokens,
+                    long_ctx_threshold=long_ctx_threshold,
+                    long_ctx_runs=long_ctx_runs,
+                    out_tokens_long_ctx=out_tokens_long_ctx,
+                )
+                total_requests += job_runs * p
     done_requests = 0
     started_at = time.time()
 
@@ -109,8 +150,18 @@ async def run_headless(config: Dict[str, Any]) -> int:
 
                 job_no += 1
                 job_id = f"{model}||{par}||{ctx}"
+                job_runs, job_out_tokens = _job_profile_for_context(
+                    ctx=ctx,
+                    max_ctx=max_ctx,
+                    runs=runs,
+                    out_tokens=out_tokens,
+                    long_ctx_threshold=long_ctx_threshold,
+                    long_ctx_runs=long_ctx_runs,
+                    out_tokens_long_ctx=out_tokens_long_ctx,
+                )
                 print(
-                    f"[{_now_utc_iso()}] [{job_no}/{total_jobs}] Starting model={model} ctx={ctx} par={par}",
+                    f"[{_now_utc_iso()}] [{job_no}/{total_jobs}] Starting model={model} ctx={ctx} par={par} "
+                    f"runs={job_runs} out_tokens={job_out_tokens}",
                     flush=True,
                 )
                 job_start = time.time()
@@ -171,9 +222,9 @@ async def run_headless(config: Dict[str, Any]) -> int:
                     model=model,
                     target_prompt_tokens=ctx,
                     parallel=par,
-                    runs=runs,
+                    runs=job_runs,
                     warmup=warmup,
-                    max_output_tokens=out_tokens,
+                    max_output_tokens=job_out_tokens,
                     temperature=0.0,
                     timeout_s=timeout_s,
                     stream_ttft=True,

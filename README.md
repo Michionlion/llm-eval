@@ -6,9 +6,18 @@ This project benchmarks OpenAI-compatible chat completion endpoints with a Textu
 
 - Set `BASE_URL` to your OpenAI-compatible endpoint and `LITELLM_KEY` (if required).
 - Optionally set `SWEEP_COUNT` to control the number of context sweep steps (default 8).
+- Optionally tune output and long-context speed controls:
+  - `OUT_TOKENS` (default 128)
+  - `OUT_TOKENS_LONG_CTX` (default half of `OUT_TOKENS`, min 16)
+  - `LONG_CTX_THRESHOLD` (default 0.75)
+  - `LONG_CTX_RUNS` (default 1)
 - Run `python bench_tui.py`.
 
 The TUI loads models, lets you select parallelism and target prompt tokens, then sweeps context lengths (1/`SWEEP_COUNT` → full) for each model/parallel combo.
+
+When context size reaches `LONG_CTX_THRESHOLD` of the max sweep context, the runner automatically uses
+smaller decode budgets (`OUT_TOKENS_LONG_CTX`) and fewer runs (`LONG_CTX_RUNS`) so saturation checks
+still happen without making large model matrices take excessively long.
 
 ## Outputs
 

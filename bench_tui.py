@@ -278,6 +278,25 @@ class LLMBenchTUI(App):
             context_sizes.append(max_tokens)
         return context_sizes
 
+    def _job_profile_for_context(
+        self,
+        *,
+        ctx: int,
+        max_ctx: int,
+        runs: int,
+        out_tokens: int,
+        long_ctx_threshold: float,
+        long_ctx_runs: int,
+        out_tokens_long_ctx: int,
+    ) -> Tuple[int, int]:
+        ratio = (ctx / max(1, max_ctx))
+        if ratio >= long_ctx_threshold:
+            return (
+                max(1, min(runs, long_ctx_runs)),
+                max(1, min(out_tokens, out_tokens_long_ctx)),
+            )
+        return runs, out_tokens
+
     def _launch_background_run(
         self,
         *,
@@ -285,7 +304,10 @@ class LLMBenchTUI(App):
         pars: List[int],
         context_sizes: List[int],
         out_tokens: int,
+        out_tokens_long_ctx: int,
         runs: int,
+        long_ctx_runs: int,
+        long_ctx_threshold: float,
         warmup: int,
         timeout_s: float,
         chars_per_token_est: float,
@@ -307,7 +329,10 @@ class LLMBenchTUI(App):
             "pars": pars,
             "context_sizes": context_sizes,
             "out_tokens": out_tokens,
+            "out_tokens_long_ctx": out_tokens_long_ctx,
             "runs": runs,
+            "long_ctx_runs": long_ctx_runs,
+            "long_ctx_threshold": long_ctx_threshold,
             "warmup": warmup,
             "timeout_s": timeout_s,
             "chars_per_token_est": chars_per_token_est,
@@ -838,11 +863,24 @@ class LLMBenchTUI(App):
             self._log_pre_message(f"Bad numeric input: {e}")
             return
         try:
-            out_tokens = int(os.getenv("OUT_TOKENS", "512"))
+            out_tokens = int(os.getenv("OUT_TOKENS", "128"))
+            out_tokens_long_ctx = int(os.getenv("OUT_TOKENS_LONG_CTX", str(max(16, out_tokens // 2))))
+            long_ctx_runs = int(os.getenv("LONG_CTX_RUNS", "1"))
+            long_ctx_threshold = float(os.getenv("LONG_CTX_THRESHOLD", "0.75"))
         except Exception as e:
-            self._set_pre_status(f"Bad OUT_TOKENS env: {e}")
-            self._log_pre_message(f"Bad OUT_TOKENS env: {e}")
+            self._set_pre_status(f"Bad benchmark env overrides: {e}")
+            self._log_pre_message(f"Bad benchmark env overrides: {e}")
             return
+        if out_tokens < 1:
+            out_tokens = 1
+        if out_tokens_long_ctx < 1:
+            out_tokens_long_ctx = 1
+        if long_ctx_runs < 1:
+            long_ctx_runs = 1
+        if long_ctx_threshold < 0.0:
+            long_ctx_threshold = 0.0
+        if long_ctx_threshold > 1.0:
+            long_ctx_threshold = 1.0
         if sweep_count < 1:
             sweep_count = 1
             sweep_input = self.query_one("#sweep_count", Input)
@@ -866,7 +904,10 @@ class LLMBenchTUI(App):
                     pars=pars,
                     context_sizes=context_sizes,
                     out_tokens=out_tokens,
+                    out_tokens_long_ctx=out_tokens_long_ctx,
                     runs=runs,
+                    long_ctx_runs=long_ctx_runs,
+                    long_ctx_threshold=long_ctx_threshold,
                     warmup=warmup,
                     timeout_s=timeout_s,
                     chars_per_token_est=chars_per_token_est,
@@ -894,7 +935,10 @@ class LLMBenchTUI(App):
                 pars,
                 context_sizes,
                 out_tokens,
+                out_tokens_long_ctx,
                 runs,
+                long_ctx_runs,
+                long_ctx_threshold,
                 warmup,
                 timeout_s,
                 chars_per_token_est,
@@ -910,7 +954,10 @@ class LLMBenchTUI(App):
         pars: List[int],
         context_sizes: List[int],
         out_tokens: int,
+        out_tokens_long_ctx: int,
         runs: int,
+        long_ctx_runs: int,
+        long_ctx_threshold: float,
         warmup: int,
         timeout_s: float,
         chars_per_token_est: float,
@@ -943,11 +990,23 @@ class LLMBenchTUI(App):
         self.total_requests = 0
         self.query_one("#pre_log", RichLog).clear()
         self.query_one("#back_to_setup", Button).add_class("hidden")
+        max_ctx = max(context_sizes) if context_sizes else 1
+        job_profile: Dict[Tuple[str, int, int], Tuple[int, int]] = {}
         for m in models:
             for ctx in context_sizes:
                 for p in pars:
                     key = (m, p, ctx)
-                    self.job_req_total[key] = runs * p
+                    job_runs, job_out_tokens = self._job_profile_for_context(
+                        ctx=ctx,
+                        max_ctx=max_ctx,
+                        runs=runs,
+                        out_tokens=out_tokens,
+                        long_ctx_threshold=long_ctx_threshold,
+                        long_ctx_runs=long_ctx_runs,
+                        out_tokens_long_ctx=out_tokens_long_ctx,
+                    )
+                    job_profile[key] = (job_runs, job_out_tokens)
+                    self.job_req_total[key] = job_runs * p
                     self.job_req_done[key] = 0
                     self.job_errs[key] = 0
                     self.job_completion_sum_total[key] = 0
@@ -962,7 +1021,7 @@ class LLMBenchTUI(App):
                     self.job_err_idxs[key] = set()
                     self.job_warmup_total[key] = warmup
                     self.job_warmup_done[key] = 0
-                    self.total_requests += runs * p
+                    self.total_requests += job_runs * p
 
         self.done_requests = 0
         self.req_wall_samples = []
@@ -984,6 +1043,7 @@ class LLMBenchTUI(App):
                 for p in pars:
                     job_id = f"{m}||{p}||{ctx}"
                     key = (m, p, ctx)
+                    job_runs, job_out_tokens = job_profile.get(key, (runs, out_tokens))
                     row_id = self.row_key_to_id.get(key)
                     if row_id is not None:
                         table = self.query_one(DataTable)
@@ -998,9 +1058,9 @@ class LLMBenchTUI(App):
                         model=m,
                         target_prompt_tokens=ctx,
                         parallel=p,
-                        runs=runs,
+                        runs=job_runs,
                         warmup=warmup,
-                        max_output_tokens=out_tokens,
+                        max_output_tokens=job_out_tokens,
                         temperature=0.0,
                         timeout_s=timeout_s,
                         stream_ttft=True,
